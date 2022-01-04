@@ -1,24 +1,36 @@
-#! /usr/bin/env python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Reads Darknet config and weights and creates Keras model with TF backend.
 
-"""
+Support YOLOv2/v3/v4 families and Yolo-Fastest from following links:
 
+https://pjreddie.com/darknet/yolo/
+https://github.com/AlexeyAB/darknet
+https://github.com/dog-qiuqiu/Yolo-Fastest
+
+Refer README.md for usage details.
+
+"""
 import argparse
 import configparser
 import io
-import os
+import os, sys
 from collections import defaultdict
 
 import numpy as np
-from keras import backend as K
-from keras.layers import (Conv2D, Input, ZeroPadding2D, Add, BatchNormalization, Layer, 
-                          UpSampling2D, MaxPooling2D, Concatenate)
-from keras.layers.advanced_activations import LeakyReLU
-from keras.models import Model
-from keras.regularizers import l2
-from keras.utils.vis_utils import plot_model as plot
+import tensorflow as tf
+from tensorflow.keras import backend as K
+from tensorflow.keras.layers import (Conv2D, DepthwiseConv2D, Input, ZeroPadding2D, Add, Multiply, Lambda, Dropout,Reshape,
+                          UpSampling2D, MaxPooling2D, AveragePooling2D, Concatenate, Activation, GlobalAveragePooling2D)
+from tensorflow.keras.layers import LeakyReLU, ReLU
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.models import Model
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.utils import plot_model as plot
 
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..'))
+# from yolo4.models.layers import mish
 
 parser = argparse.ArgumentParser(description='Darknet To Keras Converter.')
 parser.add_argument('config_path', help='Path to Darknet cfg file.')
@@ -34,6 +46,17 @@ parser.add_argument(
     '--weights_only',
     help='Save as Keras weights file instead of model file.',
     action='store_true')
+parser.add_argument(
+    '-f',
+    '--fixed_input_shape',
+    help='Use fixed input shape specified in cfg.',
+    action='store_true')
+parser.add_argument(
+    '-r',
+    '--yolo4_reorder',
+    help='Reorder output tensors for YOLOv4 cfg and weights file.',
+    action='store_true')
+
 
 def unique_config_sections(config_file):
     """Convert all config sections to have unique names.
@@ -52,23 +75,9 @@ def unique_config_sections(config_file):
             output_stream.write(line)
     output_stream.seek(0)
     return output_stream
-class Mish(Layer):
-    def __init__(self, **kwargs):
-        super(Mish, self).__init__(**kwargs)
-        self.supports_masking = True
 
-    def call(self, inputs):
-        return inputs * K.tanh(K.softplus(inputs))
 
-    def get_config(self):
-        config = super(Mish, self).get_config()
-        return config
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-# %%
-def _main(args):
+def main(args):
     config_path = os.path.expanduser(args.config_path)
     weights_path = os.path.expanduser(args.weights_path)
     assert config_path.endswith('.cfg'), '{} is not a .cfg file'.format(
@@ -77,8 +86,8 @@ def _main(args):
         '.weights'), '{} is not a .weights file'.format(weights_path)
 
     output_path = os.path.expanduser(args.output_path)
-    assert output_path.endswith(
-        '.h5'), 'output path {} is not a .h5 file'.format(output_path)
+    #assert output_path.endswith(
+        #'.h5'), 'output path {} is not a .h5 file'.format(output_path)
     output_root = os.path.splitext(output_path)[0]
 
     # Load weights and config.
@@ -97,13 +106,20 @@ def _main(args):
     cfg_parser = configparser.ConfigParser()
     cfg_parser.read_file(unique_config_file)
 
+    weight_decay = float(cfg_parser['net_0']['decay']) if 'net_0' in cfg_parser.sections() else 5e-4
+
+    # Parase model input width, height
+    width = int(cfg_parser['net_0']['width']) if 'net_0' in cfg_parser.sections() else None
+    height = int(cfg_parser['net_0']['height']) if 'net_0' in cfg_parser.sections() else None
+
     print('Creating Keras model.')
-    input_layer = Input(shape=(None, None, 3))
+    if width and height and args.fixed_input_shape:
+        input_layer = Input(shape=(height, width, 3), name='image_input')
+    else:
+        input_layer = Input(shape=(None, None, 3), name='image_input')
     prev_layer = input_layer
     all_layers = []
 
-    weight_decay = float(cfg_parser['net_0']['decay']
-                         ) if 'net_0' in cfg_parser.sections() else 5e-4
     count = 0
     out_index = []
     for section in cfg_parser.sections():
@@ -118,17 +134,37 @@ def _main(args):
 
             padding = 'same' if pad == 1 and stride == 1 else 'valid'
 
+            # support DepthwiseConv2D with "groups"
+            # option in conv section
+            if 'groups' in cfg_parser[section]:
+                groups = int(cfg_parser[section]['groups'])
+                # Now only support DepthwiseConv2D with "depth_multiplier=1",
+                # which means conv groups should be same as filters
+                assert groups == filters, 'Only support groups is same as filters.'
+                depthwise = True
+                depth_multiplier = 1
+            else:
+                depthwise = False
+
             # Setting weights.
             # Darknet serializes convolutional weights as:
             # [bias/beta, [gamma, mean, variance], conv_weights]
             prev_layer_shape = K.int_shape(prev_layer)
 
-            weights_shape = (size, size, prev_layer_shape[-1], filters)
-            darknet_w_shape = (filters, weights_shape[2], size, size)
-            weights_size = np.product(weights_shape)
-
-            print('conv2d', 'bn'
-                  if batch_normalize else '  ', activation, weights_shape)
+            if depthwise:
+                # DepthwiseConv2D weights shape in TF:
+                # (kernel_size, kernel_size, in_channels, depth_multiplier).
+                weights_shape = (size, size, prev_layer_shape[-1], depth_multiplier)
+                darknet_w_shape = (depth_multiplier, weights_shape[2], size, size)
+                weights_size = np.product(weights_shape)
+                print('depthwiseconv2d', 'bn'
+                      if batch_normalize else '  ', activation, weights_shape)
+            else:
+                weights_shape = (size, size, prev_layer_shape[-1], filters)
+                darknet_w_shape = (filters, weights_shape[2], size, size)
+                weights_size = np.product(weights_shape)
+                print('conv2d', 'bn'
+                      if batch_normalize else '  ', activation, weights_shape)
 
             conv_bias = np.ndarray(
                 shape=(filters, ),
@@ -169,6 +205,12 @@ def _main(args):
             act_fn = None
             if activation == 'leaky':
                 pass  # Add advanced activation later.
+            elif activation == 'relu':
+                pass  # Add advanced activation later.
+            elif activation == 'mish':
+                pass  # Add advanced activation later.
+            elif activation == 'logistic':
+                pass  # Add advanced activation later.
             elif activation != 'linear':
                 raise ValueError(
                     'Unknown activation function `{}` in section {}'.format(
@@ -178,14 +220,26 @@ def _main(args):
             if stride>1:
                 # Darknet uses left and top padding instead of 'same' mode
                 prev_layer = ZeroPadding2D(((1,0),(1,0)))(prev_layer)
-            conv_layer = (Conv2D(
-                filters, (size, size),
-                strides=(stride, stride),
-                kernel_regularizer=l2(weight_decay),
-                use_bias=not batch_normalize,
-                weights=conv_weights,
-                activation=act_fn,
-                padding=padding))(prev_layer)
+
+            if depthwise:
+                conv_layer = (DepthwiseConv2D(
+                    (size, size),
+                    strides=(stride, stride),
+                    depth_multiplier=depth_multiplier,
+                    kernel_regularizer=l2(weight_decay),
+                    use_bias=not batch_normalize,
+                    weights=conv_weights,
+                    activation=act_fn,
+                    padding=padding))(prev_layer)
+            else:
+                conv_layer = (Conv2D(
+                    filters, (size, size),
+                    strides=(stride, stride),
+                    kernel_regularizer=l2(weight_decay),
+                    use_bias=not batch_normalize,
+                    weights=conv_weights,
+                    activation=act_fn,
+                    padding=padding))(prev_layer)
 
             if batch_normalize:
                 conv_layer = (BatchNormalization(
@@ -195,26 +249,56 @@ def _main(args):
             if activation == 'linear':
                 all_layers.append(prev_layer)
             elif activation == 'mish':
-                act_layer = Mish()(prev_layer)
+                act_layer = Activation(mish)(prev_layer)
                 prev_layer = act_layer
                 all_layers.append(act_layer)
             elif activation == 'leaky':
                 act_layer = LeakyReLU(alpha=0.1)(prev_layer)
                 prev_layer = act_layer
                 all_layers.append(act_layer)
+            elif activation == 'relu':
+                act_layer = ReLU()(prev_layer)
+                prev_layer = act_layer
+                all_layers.append(act_layer)
+            elif activation == 'logistic':
+                act_layer = Activation('sigmoid')(prev_layer)
+                prev_layer = act_layer
+                all_layers.append(act_layer)
 
         elif section.startswith('route'):
             ids = [int(i) for i in cfg_parser[section]['layers'].split(',')]
             layers = [all_layers[i] for i in ids]
-            if len(layers) > 1:
-                print('Concatenating route layers:', layers)
-                concatenate_layer = Concatenate()(layers)
-                all_layers.append(concatenate_layer)
-                prev_layer = concatenate_layer
+
+            if ('groups' in cfg_parser[section]):
+                # support route with groups, which is for splitting input tensor into group
+                # Reference comment (from AlexeyAB):
+                #
+                # https://github.com/lutzroeder/netron/issues/531
+                #
+                assert 'group_id' in cfg_parser[section], 'route with groups should have group_id.'
+                assert len(layers) == 1, 'route with groups should have 1 input layer.'
+
+                groups = int(cfg_parser[section]['groups'])
+                group_id = int(cfg_parser[section]['group_id'])
+                route_layer = layers[0]  # group route only have 1 input layer
+                print('Split {} to {} groups and pick id {}'.format(route_layer, groups, group_id))
+
+                all_layers.append(
+                    Lambda(
+                        # tf.split implementation for groups route
+                        lambda x: tf.split(x, num_or_size_splits=groups, axis=-1)[group_id],
+                        name='group_route_'+str(len(all_layers)))(route_layer))
+                prev_layer = all_layers[-1]
             else:
-                skip_layer = layers[0]  # only one layer to route
-                all_layers.append(skip_layer)
-                prev_layer = skip_layer
+                if len(layers) > 1:
+                    print('Concatenating route layers:', layers)
+                    concatenate_layer = Concatenate()(layers)
+                    all_layers.append(concatenate_layer)
+                    prev_layer = concatenate_layer
+                else:
+                    skip_layer = layers[0]  # only one layer to route
+                    all_layers.append(skip_layer)
+                    prev_layer = skip_layer
 
         elif section.startswith('maxpool'):
             size = int(cfg_parser[section]['size'])
@@ -226,6 +310,26 @@ def _main(args):
                     padding='same')(prev_layer))
             prev_layer = all_layers[-1]
 
+        elif section.startswith('avgpool'):
+            all_layers.append(
+                AveragePooling2D()(prev_layer))
+            prev_layer = all_layers[-1]
+
+        # support GAP and Reshape layer for se block
+        # Reference:
+        #
+        # https://github.com/gitE0Z9/keras-YOLOv3-model-set/commit/67ed826f2ce00f28296fcf88c03c86f1d86b8b9e
+        #
+        elif section.startswith('gap'):
+            all_layers.append(
+                GlobalAveragePooling2D()(prev_layer))
+            prev_layer = all_layers[-1]
+
+        elif section.startswith('reshape'):
+            all_layers.append(
+                Reshape((1, 1, K.int_shape(prev_layer)[-1]))(prev_layer))
+            prev_layer = all_layers[-1]
+
         elif section.startswith('shortcut'):
             index = int(cfg_parser[section]['from'])
             activation = cfg_parser[section]['activation']
@@ -233,18 +337,50 @@ def _main(args):
             all_layers.append(Add()([all_layers[index], prev_layer]))
             prev_layer = all_layers[-1]
 
+        elif section.startswith('sam'):
+            # support SAM (Modified Spatial Attention Module in YOLOv4) layer
+            # Reference comment:
+            #
+            # https://github.com/AlexeyAB/darknet/issues/3708
+            #
+            index = int(cfg_parser[section]['from'])
+            all_layers.append(Multiply()([all_layers[index], prev_layer]))
+            prev_layer = all_layers[-1]
+
+        elif section.startswith('dropout'):
+            rate = float(cfg_parser[section]['probability'])
+            assert rate >= 0 and rate <= 1, 'Dropout rate should be between 0 and 1, got {}.'.format(rate)
+            all_layers.append(Dropout(rate=rate)(prev_layer))
+            prev_layer = all_layers[-1]
+
         elif section.startswith('upsample'):
             stride = int(cfg_parser[section]['stride'])
-            assert stride == 2, 'Only stride=2 supported.'
+            assert stride%2 == 0, 'upsample stride should be multiples of 2'
             all_layers.append(UpSampling2D(stride)(prev_layer))
             prev_layer = all_layers[-1]
+
+        elif section.startswith('reorg'):
+            block_size = int(cfg_parser[section]['stride'])
+            assert block_size == 2, 'Only reorg with stride 2 supported.'
+            all_layers.append(
+                Lambda(
+                    #space_to_depth_x2,
+                    #output_shape=space_to_depth_x2_output_shape,
+                    lambda x: tf.nn.space_to_depth(x, block_size=2),
+                    name='space_to_depth_x2')(prev_layer))
+            prev_layer = all_layers[-1]
+
+        elif section.startswith('region'):
+            with open('{}_anchors.txt'.format(output_root), 'w') as f:
+                print(cfg_parser[section]['anchors'], file=f)
 
         elif section.startswith('yolo'):
             out_index.append(len(all_layers)-1)
             all_layers.append(None)
             prev_layer = all_layers[-1]
 
-        elif section.startswith('net'):
+        elif (section.startswith('net') or section.startswith('cost') or
+              section.startswith('softmax')):
             pass
 
         else:
@@ -253,6 +389,12 @@ def _main(args):
 
     # Create and save model.
     if len(out_index)==0: out_index.append(len(all_layers)-1)
+
+    if args.yolo4_reorder:
+        # reverse the output tensor index for YOLOv4 cfg & weights,
+        # since it use a different yolo outout order
+        out_index.reverse()
+
     model = Model(inputs=input_layer, outputs=[all_layers[i] for i in out_index])
     print(model.summary())
     if args.weights_only:
@@ -276,4 +418,4 @@ def _main(args):
 
 
 if __name__ == '__main__':
-    _main(parser.parse_args())
+    main(parser.parse_args())

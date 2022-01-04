@@ -4,11 +4,21 @@
 
 ## Introduction
 
-Modified from [qqwweee/keras-yolo3](https://github.com/qqwweee/keras-yolo3)
-
-> A Keras implementation of YOLOv3 (Tensorflow backend) inspired by [allanzelener/YAD2K](https://github.com/allanzelener/YAD2K).
-
 This repository focusing on converting `*.weight` to `*.h5` (Keras) only. Any features in [qqwweee/keras-yolo3](https://github.com/qqwweee/keras-yolo3) doesn't change.
+
+For `convert.py`, it is replaced by `convert.py` from [david8862/keras-YOLOv3-model-set](https://github.com/david8862/keras-YOLOv3-model-set/blob/master/tools/model_converter/convert.py) to prevent error message below:
+
+> TypeError: buffer is too small for requested array ...
+> 
+> @
+> ```
+> conv_weights = np.ndarray(
+>                shape=darknet_w_shape,
+>               dtype='float32',
+>               buffer=weights_file.read(weights_size * 4))
+>           count += weights_size
+> ```
+
 
 ---
 
