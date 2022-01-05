@@ -283,18 +283,24 @@ def main(args):
                 route_layer = layers[0]  # group route only have 1 input layer
                 print('Split {} to {} groups and pick id {}'.format(route_layer, groups, group_id))
 
-                if ('LeakyReLU' in cfg_parser[section]):
-                    act_layer = LeakyReLU(alpha=0.1)(route_layer)
-                    prev_layer = act_layer
-                    all_layers.append(act_layer)
-                else:
-                    all_layers.append(
-                        Lambda(
-                            # tf.split implementation for groups route
-                            lambda x: tf.split(x, num_or_size_splits=groups, axis=-1)[group_id],
-                            name='group_route_'+str(len(all_layers)))(route_layer))
 
-                    prev_layer = all_layers[-1]
+                # size = 2
+                # stride = None
+                # all_layers.append(
+                #     MaxPooling2D(
+                #         pool_size=(size, size),
+                #         strides=stride,
+                #         padding='same')(act_layer))
+                # prev_layer = all_layers[-1]
+
+                lambda_layer = Lambda(
+                  lambda x, group_id: tf.split(x, num_or_size_splits=groups,axis=-1)[group_id],
+                  name='group_route_'+str(len(all_layers)),
+                  arguments={"group_id":group_id})
+                # lambda_layer.arguments = {'group_id':group_id}
+                all_layers.append(lambda_layer(route_layer, group_id))
+                prev_layer = all_layers[-1]
+                
             else:
                 if len(layers) > 1:
                     print('Concatenating route layers:', layers)
